@@ -11,22 +11,6 @@ trait Expression {
     fn into_expr(self) -> Expr;
 }
 
-impl Expression for i32 {
-    fn into_bson(self) -> Bson {
-        self.into()
-    }
-
-    fn into_expr(self) -> Expr {
-        Expr::Number(NumberExpr::Literal(self))
-    }
-}
-
-impl NumberExpression for i32 {
-    fn into_number_expr(self) -> NumberExpr {
-        NumberExpr::Literal(self)
-    }
-}
-
 trait BooleanExpression: Expression {}
 
 trait NumberExpression: Expression {
@@ -58,17 +42,42 @@ trait NumberExpression: Expression {
             Box::new(other.into_number_expr()),
         )
     }
+
+    fn multiply(self, other: impl NumberExpression) -> NumberExpr
+    where
+        Self: Sized,
+    {
+        NumberExpr::Multiply(
+            Box::new(self.into_number_expr()),
+            Box::new(other.into_number_expr()),
+        )
+    }
 }
 
-trait IntegerExpression: Expression {}
+impl Expression for i32 {
+    fn into_bson(self) -> Bson {
+        self.into()
+    }
+
+    fn into_expr(self) -> Expr {
+        Expr::Number(NumberExpr::Literal(self))
+    }
+}
+
+impl NumberExpression for i32 {
+    fn into_number_expr(self) -> NumberExpr {
+        NumberExpr::Literal(self)
+    }
+}
 
 #[derive(Debug, Clone)]
 enum NumberExpr {
     Literal(i32),
     NumberField(NumberField),
     Mod(Box<NumberExpr>, Box<NumberExpr>),
-    Reduce(NumberArrayExpr, Box<NumberExpr>, Box<NumberExpr>),
+    Reduce(Box<NumberArrayExpr>, Box<NumberExpr>, Box<NumberExpr>),
     Add(Box<NumberExpr>, Box<NumberExpr>),
+    Multiply(Box<NumberExpr>, Box<NumberExpr>),
 }
 
 impl Expression for NumberExpr {
@@ -88,6 +97,9 @@ impl Expression for NumberExpr {
             }),
             NumberExpr::Add(lhs, rhs) => bson!({
                 "$add": [lhs.into_bson(), rhs.into_bson()]
+            }),
+            NumberExpr::Multiply(lhs, rhs) => bson!({
+                "$multiply": [lhs.into_bson(), rhs.into_bson()]
             }),
         }
     }
@@ -141,9 +153,8 @@ enum NumberArrayExpr {
     Field(NumberArrayField),
     Literal(Vec<Number>),
     Filter(Box<NumberArrayExpr>, BooleanExpr),
+    Map(Box<NumberArrayExpr>, NumberExpr),
 }
-
-impl NumberArrayExpr {}
 
 trait NumberArrayExpression {
     fn into_number_array_expr(self) -> NumberArrayExpr;
@@ -154,9 +165,32 @@ trait NumberArrayExpression {
         Self: Sized,
     {
         NumberExpr::Reduce(
-            self.into_number_array_expr(),
+            Box::new(self.into_number_array_expr()),
             Box::new(initial_value.into_number_expr()),
             Box::new(f(NumberField::new("$this"), NumberField::new("$value"))),
+        )
+    }
+
+    fn filter<F>(self, f: F) -> NumberArrayExpr
+    where
+        F: FnOnce(NumberField) -> BooleanExpr,
+        Self: Sized,
+    {
+        NumberArrayExpr::Filter(
+            Box::new(self.into_number_array_expr()),
+            f(NumberField::new("$this")),
+        )
+    }
+
+    // TODO: support mapping to/from arbitrary types
+    fn map<F>(self, f: F) -> NumberArrayExpr
+    where
+        F: FnOnce(NumberField) -> NumberExpr,
+        Self: Sized,
+    {
+        NumberArrayExpr::Map(
+            Box::new(self.into_number_array_expr()),
+            f(NumberField::new("$this")),
         )
     }
 }
@@ -173,6 +207,14 @@ impl Expression for NumberArrayExpr {
                     "$filter": {
                         "input": expr.into_bson(),
                         "cond": f.into_bson(),
+                    }
+                })
+            }
+            NumberArrayExpr::Map(a, f) => {
+                bson!({
+                    "$map": {
+                        "input": a.into_bson(),
+                        "in": f.into_bson()
                     }
                 })
             }
@@ -245,16 +287,6 @@ impl Field for NumberArrayField {
 impl NumberArrayField {
     fn new(s: impl Into<String>) -> Self {
         Self(s.into())
-    }
-
-    fn filter<F>(self, f: F) -> NumberArrayExpr
-    where
-        F: FnOnce(NumberField) -> BooleanExpr,
-    {
-        NumberArrayExpr::Filter(
-            Box::new(NumberArrayExpr::Field(self)),
-            f(NumberField::new("$this")),
-        )
     }
 }
 
@@ -398,6 +430,7 @@ async fn main() -> Result<()> {
         .add_field(NumberField::new("output"), |s| {
             s.num_list()
                 .filter(|n| n.modulo(2).eq(0))
+                .map(|n| n.multiply(10))
                 .reduce(0, |this, value| this.add(value))
         })
         .unset(|s| s.num_list());
